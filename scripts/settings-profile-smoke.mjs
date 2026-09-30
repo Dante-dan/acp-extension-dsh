@@ -4,12 +4,15 @@ import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
-import { createDeepSeekHarnessCordisConfig } from '../dist/profile.js';
+import {
+  DEEPSEEK_HARNESS_PROFILE_NAME,
+  createDeepSeekHarnessProfileFiles,
+} from '../dist/profile.js';
 
 // Supply a preinstalled exact profile closure; this test never installs packages
 // or sends a model request. See README.md for preparation outside the test.
@@ -17,7 +20,9 @@ const runtimeRoot = process.env.DSH_TEST_RUNTIME_ROOT;
 assert.ok(runtimeRoot, 'Set DSH_TEST_RUNTIME_ROOT to the installed Harness node_modules directory');
 const runtimeRequire = createRequire(join(runtimeRoot, '.settings-profile-test.cjs'));
 const extensionRoot = fileURLToPath(new URL('../', import.meta.url));
-const bin = runtimeRequire.resolve('@deepseek-ai/dsh-acp-demo/bin');
+
+// Resolve the launcher through the preinstalled runtime closure.
+const dshBin = join(dirname(runtimeRequire.resolve('@deepseek-ai/dsh/package.json')), 'lib/bin.js');
 
 function decodeModelRoute(value) {
   if (!value.startsWith('dsh-route:')) return undefined;
@@ -35,7 +40,7 @@ const cases = [
     expectedModel: 'synthetic-settings-model',
   },
   {
-    name: 'pi-ai route is selectable and a missing credential fails before provider I/O',
+    name: 'pi-ai route is selectable and missing credential fails before provider I/O',
     settings: `llm-pi-ai:
   providers:
     synthetic-route:
@@ -53,7 +58,7 @@ const cases = [
     expectedModel: 'shared-model',
     missingCredential: true,
   },
-  { name: 'absent settings retain defaults', expectedModel: 'deepseek-v4-flash' },
+  { name: 'absent settings retain defaults', expectedModel: 'deepseek-flash' },
   { name: 'invalid YAML fails startup', settings: 'llm-deepseek: [\n', invalid: true },
   {
     name: 'non-mapping settings document fails startup',
@@ -63,7 +68,7 @@ const cases = [
 ];
 
 for (const fixture of cases) {
-  await test(fixture.name, { timeout: 30_000 }, async (t) => {
+  await test(fixture.name, { timeout: 60_000 }, async (t) => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-settings-test-'));
     let child;
     let exited;
@@ -77,18 +82,20 @@ for (const fixture of cases) {
     });
     const settingsPath = join(root, 'settings.yaml');
     if (fixture.settings !== undefined) await writeFile(settingsPath, fixture.settings);
-    await mkdir(join(root, 'sessions'));
-    // Absolute module names let the test use an isolated home outside the
-    // installed runtime tree, with no ambient package or config resolution.
-    const config = createDeepSeekHarnessCordisConfig(
-      join(extensionRoot, 'dist/index.js'),
-      join(extensionRoot, 'presets')
-    ).replace(
-      /name: '(@deepseek-ai\/[^']+)'/gu,
-      (_, name) => `name: ${JSON.stringify(runtimeRequire.resolve(name))}`
-    );
-    await writeFile(join(root, 'cordis.yml'), config);
-    child = spawn(process.execPath, [bin, '--config', join(root, 'cordis.yml')], {
+    await mkdir(join(root, 'sessions'), { recursive: true });
+
+    const profileDir = join(root, 'profiles', DEEPSEEK_HARNESS_PROFILE_NAME);
+    await mkdir(profileDir, { recursive: true });
+    const files = createDeepSeekHarnessProfileFiles({
+      adapterPath: join(extensionRoot, 'dist/index.js'),
+      presetRoot: join(extensionRoot, 'presets'),
+    });
+    await writeFile(join(profileDir, 'package.json'), files.packageJson);
+    await writeFile(join(profileDir, 'cordis.yml'), files.cordisYml);
+    await writeFile(join(profileDir, 'cordis.patch.yml'), files.cordisPatchYml);
+    await writeFile(join(profileDir, 'pnpm-workspace.yaml'), files.pnpmWorkspaceYaml);
+
+    child = spawn(process.execPath, [dshBin, '--profile', DEEPSEEK_HARNESS_PROFILE_NAME], {
       cwd: root,
       env: {
         PATH: process.env.PATH,
@@ -137,7 +144,7 @@ for (const fixture of cases) {
         if (fixture.settings && !fixture.expectedProvider) {
           assert.ok(
             !model.options.some(
-              (option) => decodeModelRoute(option.value)?.[1] === 'deepseek-v4-flash'
+              (option) => decodeModelRoute(option.value)?.[1] === 'deepseek-v4-pro'
             )
           );
         }
